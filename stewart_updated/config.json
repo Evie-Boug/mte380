@@ -1,0 +1,60 @@
+{
+  "pca9685_address": "0x40",
+  "pwm_frequency_hz": 50,
+  "geometry": {
+    "base_radius_mm": 60.0,
+    "platform_radius_mm": 140.0,
+    "horn_length_mm": 80.0,
+    "upper_link_length_mm": 125.0,
+    "nominal_heave_mm": 110.0,
+    "radial_angles_deg": [
+      90.0,
+      -30.0,
+      -150.0
+    ],
+    "ik_branch": -1.0,
+    "ik_margin": 0.98
+  },
+  "servos": [
+    {
+      "channel": 0,
+      "servo_at_neutral_deg": 95.0,
+      "servo_direction": -1,
+      "pulse_min_us": 1000,
+      "pulse_max_us": 2000,
+      "actuation_range_deg": 180,
+      "servo_min_deg": 5.0,
+      "servo_max_deg": 175.0,
+      "motor_min_deg": -80.0,
+      "motor_max_deg": 150.0
+    },
+    {
+      "channel": 1,
+      "servo_at_neutral_deg": 80.0,
+      "servo_direction": -1,
+      "pulse_min_us": 1000,
+      "pulse_max_us": 2000,
+      "actuation_range_deg": 180,
+      "servo_min_deg": 5.0,
+      "servo_max_deg": 175.0,
+      "motor_min_deg": -80.0,
+      "motor_max_deg": 100.0
+    },
+    {
+      "channel": 2,
+      "servo_at_neutral_deg": 80.0,
+      "servo_direction": -1,
+      "pulse_min_us": 1000,
+      "pulse_max_us": 2000,
+      "actuation_range_deg": 180,
+      "servo_min_deg": 5.0,
+      "servo_max_deg": 175.0,
+      "motor_min_deg": -80.0,
+      "motor_max_deg": 100.0
+    }
+  ],
+  "motion": {
+    "max_servo_speed_dps": 3.0,
+    "update_hz": 20.0
+  }
+}

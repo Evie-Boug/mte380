@@ -220,8 +220,9 @@ class TrajectoryPlanner:
         self.speed, self.accel = speed, accel
         s, t, v, V, A, _ = plan_speed_profile(
             P, speed, accel, TANGENTIAL_ACCEL_FRACTION * accel, stop_indices)
-        self._cols = (t, s, P[:, 0].copy(), P[:, 1].copy(), V[:, 0].copy(),
-                      V[:, 1].copy(), A[:, 0].copy(), A[:, 1].copy())
+        # One table row per sample: t, s, px, py, vx, vy, ax, ay
+        self._cols = np.column_stack((t, s, P, V, A))
+        self._t = t
         self.path = P
         end = len(P) if display_end is None else int(display_end)
         step = max(1, end // 400)
@@ -281,12 +282,20 @@ class TrajectoryPlanner:
             self.stopping = True
 
     # --------------------------------------------------------------- runtime
-    def _sample(self, tau):
-        t, _, px, py, vx, vy, ax, ay = self._cols
+    def _row(self, tau):
+        """Linearly interpolated table row at path time tau (one lookup)."""
+        tab, t = self._cols, self._t
         tau = min(max(tau, 0.0), self.duration)
-        return (np.array([np.interp(tau, t, px), np.interp(tau, t, py)]),
-                np.array([np.interp(tau, t, vx), np.interp(tau, t, vy)]),
-                np.array([np.interp(tau, t, ax), np.interp(tau, t, ay)]))
+        i = int(np.searchsorted(t, tau))
+        if i <= 0:
+            return tab[0]
+        t0, t1 = t[i - 1], t[i]
+        w = (tau - t0) / (t1 - t0) if t1 > t0 else 0.0
+        return tab[i - 1] + w * (tab[i] - tab[i - 1])
+
+    def _sample(self, tau):
+        r = self._row(tau)
+        return r[2:4], r[4:6], r[6:8]
 
     def update(self, now, position=None, horizon=0.0):
         """Advance the path clock and return (p_ref, v_ref, a_ref).
@@ -308,8 +317,8 @@ class TrajectoryPlanner:
         horizon = max(0.0, float(horizon))
 
         f = self.pace
-        p_look, _, _ = self._sample(self.tau + f * horizon)
-        err = float(np.linalg.norm(np.asarray(position, float) - p_look))
+        look = self._row(self.tau + f * horizon)
+        err = math.hypot(float(position[0]) - look[2], float(position[1]) - look[3])
         if self.stopping:
             goal = 0.0
         else:
@@ -324,19 +333,21 @@ class TrajectoryPlanner:
         if self.tau >= self.duration:
             self._set_hold(self.target)
             return self.reference.copy(), zero, zero.copy()
+        now_row = self._row(self.tau)
         if self.stopping and f <= STOP_PACE:
-            self._set_hold(self._sample(self.tau)[0])
+            self._set_hold(now_row[2:4])
             return self.reference.copy(), zero, zero.copy()
 
-        self.reference = self._sample(self.tau)[0]
+        self.reference = now_row[2:4].copy()
         if self.laps and self._lap_len > 0:
-            s_now = float(np.interp(self.tau, self._cols[0], self._cols[1]))
+            s_now = float(now_row[1])
             if s_now < self._lead_len:
                 self.lap = 0
             else:
                 self.lap = min(self.laps, int((s_now - self._lead_len) // self._lap_len) + 1)
-        p, V, A = self._sample(self.tau + f * horizon)
-        return p, f * V, f * f * A + f_dot * V
+        r = self._row(self.tau + f * horizon)
+        V = r[4:6]
+        return r[2:4], f * V, f * f * r[6:8] + f_dot * V
 
     def status_text(self):
         if not self.running:

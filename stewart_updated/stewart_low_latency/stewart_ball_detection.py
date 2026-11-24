@@ -44,6 +44,7 @@ class BallDetector:
         # Precompute maps once rather than calling cv2.undistort on every frame.
         self.map_x, self.map_y = cv2.initUndistortRectifyMap(
             self.K, self.dist, None, self.K, self.size, cv2.CV_16SC2)
+        self._preview_maps = {1.0: (self.map_x, self.map_y)}
         self.affine = None
         self.image_clicks = []
         self._overlay_geometry = None
@@ -113,11 +114,19 @@ class BallDetector:
             }, indent=2))
         return len(self.image_clicks)
 
-    def undistort(self, frame):
+    def undistort(self, frame, scale=1.0):
+        """Undistort; scale < 1 produces a smaller image directly (cheaper remap)."""
         if (frame.shape[1], frame.shape[0]) != self.size:
             raise ValueError(f'Camera frame resolution must be {self.size}, got '
                              f'{(frame.shape[1], frame.shape[0])}')
-        return cv2.remap(frame, self.map_x, self.map_y, cv2.INTER_LINEAR)
+        maps = self._preview_maps.get(scale)
+        if maps is None:
+            K_out = self.K.copy()
+            K_out[:2] *= scale
+            size = (int(round(self.size[0] * scale)), int(round(self.size[1] * scale)))
+            maps = cv2.initUndistortRectifyMap(self.K, self.dist, None, K_out, size, cv2.CV_16SC2)
+            self._preview_maps[scale] = maps
+        return cv2.remap(frame, maps[0], maps[1], cv2.INTER_LINEAR)
 
     def pixel_to_mm(self, xy):
         if self.affine is None:
@@ -187,12 +196,14 @@ class BallDetector:
         self._last_raw_px = raw_px
         return {'found': True, 'pixel': pixel, 'radius_px': radius, 'xy_mm': mm, 'mask': mask}
 
-    def draw(self, frame, result, setpoint=(0, 0), path_mm=None):
-        out = frame.copy()
+    def draw(self, frame, result, setpoint=(0, 0), path_mm=None, scale=1.0):
+        """Draw overlays. All geometry is in full-resolution undistorted pixels and
+        is multiplied by `scale` to match a reduced-size preview frame."""
+        out = frame
+        def px(pt):
+            return (int(round(pt[0] * scale)), int(round(pt[1] * scale)))
+        thick = 2 if scale >= 0.75 else 1
         if self.affine is not None:
-            # Circle through all three calibrated attachment points.
-            # Affine projection may look elliptical in camera perspective.
-            # Static geometry is projected ONCE per calibration, not each GUI frame.
             if self._overlay_geometry is None:
                 center, plate_r = self.calibration_circle_mm()
                 angles = np.linspace(0, 2 * np.pi, 121, endpoint=False)
@@ -202,33 +213,33 @@ class BallDetector:
                     inv = np.linalg.inv(np.vstack((self.affine, [0, 0, 1])))
                     self._inverse_affine = inv
                 uv = np.column_stack((xy, np.ones(len(xy)))) @ inv.T
-                outline = np.rint(uv[:, :2]).astype(np.int32).reshape(-1, 1, 2)
                 anchors = [self.mm_to_pixel(p) for p in self.target_points_mm()]
-                self._overlay_geometry = (outline, anchors, self.mm_to_pixel((0, 0)),
+                self._overlay_geometry = (uv[:, :2], anchors, self.mm_to_pixel((0, 0)),
                                           self.mm_to_pixel((50, 0)), self.mm_to_pixel((0, 50)))
             outline, anchors, origin, axis_x, axis_y = self._overlay_geometry
-            cv2.polylines(out, [outline], True, (255, 190, 0), 2)
+            cv2.polylines(out, [np.rint(outline * scale).astype(np.int32).reshape(-1, 1, 2)],
+                          True, (255, 190, 0), thick)
             if path_mm is not None and len(path_mm) > 1:
                 pts = np.asarray(path_mm, float)
                 uv = np.column_stack((pts, np.ones(len(pts)))) @ self._inverse_affine.T
-                cv2.polylines(out, [np.rint(uv[:, :2]).astype(np.int32).reshape(-1, 1, 2)],
-                              False, (186, 105, 107), 1, cv2.LINE_AA)
+                cv2.polylines(out, [np.rint(uv[:, :2] * scale).astype(np.int32).reshape(-1, 1, 2)],
+                              False, (186, 105, 107), 1)
             for pt in anchors:
-                cv2.circle(out, pt, 4, (255, 190, 0), 2)
-            cv2.circle(out, origin, 5, (0, 0, 255), 2)
+                cv2.circle(out, px(pt), 4, (255, 190, 0), thick)
+            cv2.circle(out, px(origin), 4, (0, 0, 255), thick)
             goal = self.mm_to_pixel(setpoint)
-            cv2.drawMarker(out, goal, (0, 255, 255), cv2.MARKER_CROSS, 22, 2)
-            cv2.arrowedLine(out, origin, axis_x, (255, 0, 0), 2)
-            cv2.arrowedLine(out, origin, axis_y, (0, 255, 0), 2)
+            cv2.drawMarker(out, px(goal), (0, 255, 255), cv2.MARKER_CROSS, max(8, int(22 * scale)), thick)
+            cv2.arrowedLine(out, px(origin), px(axis_x), (255, 0, 0), thick)
+            cv2.arrowedLine(out, px(origin), px(axis_y), (0, 255, 0), thick)
         for i, p in enumerate(self.image_clicks):
-            cv2.circle(out, tuple(map(int, p)), 6, (255, 0, 255), 2)
-            cv2.putText(out, str(i+1), (int(p[0])+8, int(p[1])-8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            cv2.circle(out, px(p), 6, (255, 0, 255), 2)
+            x, y = px(p)
+            cv2.putText(out, str(i+1), (x + 8, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
         if result['found']:
-            x, y = map(int, result['pixel'])
-            cv2.circle(out, (x, y), int(result['radius_px']), (0, 255, 0), 2)
-            cv2.circle(out, (x, y), 3, (0, 255, 0), -1)
-            if result['xy_mm'] is not None:
+            x, y = px(result['pixel'])
+            cv2.circle(out, (x, y), max(2, int(result['radius_px'] * scale)), (0, 255, 0), thick)
+            cv2.circle(out, (x, y), 2, (0, 255, 0), -1)
+            if result['xy_mm'] is not None and scale >= 0.75:
                 cv2.putText(out, 'x={:+.1f} y={:+.1f} mm'.format(*result['xy_mm']),
                             (max(5, x-80), max(22, y-22)), cv2.FONT_HERSHEY_SIMPLEX,
                             0.55, (0, 255, 255), 2)

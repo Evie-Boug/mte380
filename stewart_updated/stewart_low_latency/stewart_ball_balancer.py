@@ -8,17 +8,18 @@ Run: python stewart_ball_balancer.py              (GUI, dry-run by default)
 First calibrate camera-to-platform XY with the GUI's Calibrate 3 points button.
 Keep the camera fixed. Verify movement sign with LOW gains before balancing.
 
-Latency pipeline (what changed)
-  * Capture thread only grab()s (no JPEG decode); a frame is decoded only when
-    the control thread is ready, so control always gets the newest frame.
-  * A Kalman filter estimates ball position AND velocity (much less lag than
-    the old EMA velocity), and the state is predicted forward by the measured
-    pipeline age + a tunable latency-compensation time before control.
-  * Servo slew limit raised from 30 to 240 deg/s; the old limit alone added
-    ~0.5 s of actuator lag.
-  * A missed frame holds the last command instead of snapping the plate level.
-  * Preview is rendered event-driven at up to 20 FPS instead of being up to
-    two 200 ms timer periods old.
+Architecture (built for a Raspberry Pi 4)
+  * TWO processes. The control process owns the camera, ball detection,
+    Kalman filter, trajectory planner, PID and servos, pinned to cores 2-3.
+    The Tk GUI runs in the main process on cores 0-1. Python's GIL is per
+    process, so nothing the GUI does (redraws, button handling, preview
+    rendering) can delay a control step.
+  * They share state through shared memory (written every control step) and
+    a command queue. Preview frames are a plain memory copy a few times per
+    second; undistortion and drawing happen in the GUI process.
+  * Capture thread only grab()s; a frame is decoded only when control is ready.
+  * Kalman filter (position, velocity, plate bias) with latency prediction.
+  * No CSV logging.
 
 Control law (per axis, output in physical degrees)
   u = Kp*(p - p_ref) + Kd*(v - v_ref) + Ki*integral + (b - Kff*a_ref)/G
@@ -27,12 +28,15 @@ acceleration estimated by the Kalman filter.  Tracking velocity error
 (instead of damping velocity to zero) is what lets the ball follow a shape.
 """
 import argparse
-from collections import deque
-import csv
 import math
+import multiprocessing as mp
+import os
 from pathlib import Path
-import time
+import queue
+import sys
 import threading
+import time
+import traceback
 
 import cv2
 import numpy as np
@@ -42,7 +46,7 @@ cv2.setNumThreads(1)
 
 import stewart_kinematics as kin
 from stewart_ball_detection import BallDetector
-from trajectory_planner import TrajectoryPlanner
+from trajectory_planner import TrajectoryPlanner, SHAPES
 
 HERE = Path(__file__).resolve().parent
 
@@ -61,8 +65,19 @@ CAMERA_FPS = 60
 CAMERA_AUTO_EXPOSURE = None
 CAMERA_EXPOSURE = None
 FRAME_WAIT_S = 0.10
-PREVIEW_HZ = 20.0
-GUI_HZ = 25.0
+# Preview is the most expensive thing on a Pi (remap + Tk image upload), and
+# the control loop never needs it. 8 FPS at half size is ~10x cheaper than
+# 20 FPS full size. Full size is used automatically while calibrating.
+PREVIEW_HZ = 8.0
+PREVIEW_SCALE = 0.5
+GUI_HZ = 10.0
+# Python hands the GIL between threads every 5 ms by default; a shorter
+# interval stops GUI work from delaying the control thread.
+GIL_SWITCH_INTERVAL_S = 0.001
+# Pi 4 has 4 cores: control process on cores 2-3, GUI process on cores 0-1.
+PIN_CPUS = True
+CONTROL_CPUS = (2, 3)
+GUI_CPUS = (0, 1)
 
 # ---------------- control ----------------
 KP, KI, KD = 0.025, 0.0, 0.015   # deg/mm, deg/(mm*s), deg*s/mm
@@ -107,7 +122,10 @@ class BallEstimator:
     and b is a slowly varying bias (plate not level, trim error, gain error).
     The controller cancels b with feed-forward, which removes steady offsets
     while tracking a moving shape far better than an integral term can.
-    Both axes share dt and noise, so one 3x3 covariance serves both.
+
+    Both axes share dt and noise, so they share ONE covariance. Everything is
+    plain-float arithmetic: on a Pi, numpy calls on 3x3 matrices cost far more
+    in per-call overhead than the maths itself.
     """
 
     def __init__(self, accel_sigma=ESTIMATOR_ACCEL_SIGMA, meas_sigma=ESTIMATOR_MEAS_SIGMA_MM,
@@ -115,44 +133,70 @@ class BallEstimator:
         self.q = accel_sigma ** 2
         self.r = meas_sigma ** 2
         self.qb = bias_sigma ** 2
-        self.b = np.zeros(2)
+        self._b = [0.0, 0.0]
         self.reset()
+
+    # numpy views for callers (cheap; not used inside the filter)
+    p = property(lambda self: np.array(self._p))
+    v = property(lambda self: np.array(self._v))
+    b = property(lambda self: np.array(self._b))
 
     def reset(self, z=None, keep_bias=True):
         """Reset position/velocity. The bias is a plate property, so it is kept."""
         self.valid = z is not None
-        self.p = np.zeros(2) if z is None else np.asarray(z, float).copy()
-        self.v = np.zeros(2)
+        self._p = [0.0, 0.0] if z is None else [float(z[0]), float(z[1])]
+        self._v = [0.0, 0.0]
         if not keep_bias:
-            self.b = np.zeros(2)
-        b_var = 40.0 ** 2 if not keep_bias or not np.any(self.b) else 15.0 ** 2
-        self.P = np.diag([self.r, 200.0 ** 2, b_var])
+            self._b = [0.0, 0.0]
+        b_var = 15.0 ** 2 if keep_bias and any(self._b) else 40.0 ** 2
+        # symmetric covariance P00 P01 P02 P11 P12 P22
+        self._P = [self.r, 0.0, 0.0, 200.0 ** 2, 0.0, b_var]
 
     def predict(self, dt, accel):
         if not self.valid:
             return
-        a = accel + self.b
-        self.p = self.p + self.v * dt + 0.5 * a * dt * dt
-        self.v = self.v + a * dt
-        F = np.array([[1.0, dt, 0.5 * dt * dt], [0.0, 1.0, dt], [0.0, 0.0, 1.0]])
-        g = np.array([0.5 * dt * dt, dt, 0.0])
-        Q = self.q * np.outer(g, g)
-        Q[2, 2] += self.qb * dt
-        self.P = F @ self.P @ F.T + Q
+        h, h2 = dt, 0.5 * dt * dt
+        for k in (0, 1):
+            a = float(accel[k]) + self._b[k]
+            self._p[k] += self._v[k] * h + a * h2
+            self._v[k] += a * h
+        P00, P01, P02, P11, P12, P22 = self._P
+        r00 = P00 + h * P01 + h2 * P02
+        r01 = P01 + h * P11 + h2 * P12
+        r02 = P02 + h * P12 + h2 * P22
+        r11 = P11 + h * P12
+        r12 = P12 + h * P22
+        q = self.q
+        self._P = [r00 + h * r01 + h2 * r02 + q * h2 * h2,
+                   r01 + h * r02 + q * h2 * h,
+                   r02,
+                   r11 + h * r12 + q * h * h,
+                   r12,
+                   P22 + self.qb * dt]
 
     def correct(self, z):
-        S = self.P[0, 0] + self.r
-        K = self.P[:, 0] / S
-        y = np.asarray(z, float) - self.p
-        self.p = self.p + K[0] * y
-        self.v = self.v + K[1] * y
-        self.b = np.clip(self.b + K[2] * y, -MAX_BIAS_ACCEL, MAX_BIAS_ACCEL)
-        self.P = self.P - np.outer(K, self.P[0, :])
+        P00, P01, P02, P11, P12, P22 = self._P
+        S = P00 + self.r
+        K0, K1, K2 = P00 / S, P01 / S, P02 / S
+        for k in (0, 1):
+            y = float(z[k]) - self._p[k]
+            self._p[k] += K0 * y
+            self._v[k] += K1 * y
+            self._b[k] = min(MAX_BIAS_ACCEL, max(-MAX_BIAS_ACCEL, self._b[k] + K2 * y))
+        self._P = [P00 - K0 * P00, P01 - K0 * P01, P02 - K0 * P02,
+                   P11 - K1 * P01, P12 - K1 * P02, P22 - K2 * P02]
+
+    def distance_to(self, z):
+        return math.hypot(float(z[0]) - self._p[0], float(z[1]) - self._p[1])
 
     def predicted(self, horizon, accel):
-        h = horizon
-        a = accel + self.b
-        return self.p + self.v * h + 0.5 * a * h * h, self.v + a * h
+        h, h2 = horizon, 0.5 * horizon * horizon
+        pp, pv = [], []
+        for k in (0, 1):
+            a = float(accel[k]) + self._b[k]
+            pp.append(self._p[k] + self._v[k] * h + a * h2)
+            pv.append(self._v[k] + a * h)
+        return pp, pv
 
 
 class AxisPID:
@@ -170,63 +214,106 @@ class AxisPID:
         ev = velocity - ref_v
         # Feed-forward: produce the reference acceleration and cancel plate bias.
         u_ff = (-self.kff * ref_a + bias_accel) / BALL_ACCEL_PER_DEG
-        i_try = float(np.clip(self.integral + e * dt, -MAX_INTEGRAL_MM_S, MAX_INTEGRAL_MM_S))
+        i_try = min(MAX_INTEGRAL_MM_S, max(-MAX_INTEGRAL_MM_S, self.integral + e * dt))
         u = self.kp * e + self.kd * ev + self.ki * i_try + u_ff
         if abs(u) < MAX_PHYSICAL_TILT_DEG:          # conditional anti-windup
             self.integral = i_try
-        return float(np.clip(u, -MAX_PHYSICAL_TILT_DEG, MAX_PHYSICAL_TILT_DEG))
+        return min(MAX_PHYSICAL_TILT_DEG, max(-MAX_PHYSICAL_TILT_DEG, u))
 
 
 class PlatformDriver:
+    """Rate-limited servo output with a scalar copy of stewart_kinematics' IK.
+
+    The IK maths is identical to kin.inverse_kinematics (roll/pitch only,
+    heave 0) but uses plain floats: ~10x cheaper per call on a Pi.
+    """
+
     def __init__(self, cfg, hardware=False):
         self.cfg = cfg
         self.kit = kin.make_kit(cfg) if hardware else None
         self.hardware = hardware
+        g = cfg['geometry']
         servos = cfg['servos']
-        # Neutral IK is cached: the old path re-solved it on every command.
-        self.q0 = kin.inverse_kinematics(kin.HOME_POSE, cfg)
-        self.neutral = np.array([float(s['servo_at_neutral_deg']) for s in servos])
-        self.direction = np.array([int(s['servo_direction']) for s in servos], float)
-        self.lo = np.array([float(s['servo_min_deg']) for s in servos])
-        self.hi = np.array([float(s['servo_max_deg']) for s in servos])
-        self.channels = [int(s['channel']) for s in servos]
-        self.angles = self.neutral.copy()        # target angle after rate limiter
-        self.sent_angles = self.neutral.copy()   # last angle actually sent over I2C
+        self._L1 = float(g['horn_length_mm'])
+        self._L2 = float(g['upper_link_length_mm'])
+        self._branch = float(g['ik_branch'])
+        self._margin = float(g.get('ik_margin', 0.98))
+        self._H = float(g['nominal_heave_mm'])
+        rb, rp = float(g['base_radius_mm']), float(g['platform_radius_mm'])
+        self._act = []
+        for i, beta in enumerate(g['radial_angles_deg']):
+            ex, ey = math.cos(math.radians(beta)), math.sin(math.radians(beta))
+            s = servos[i]
+            self._act.append((ex, ey, rb * ex, rb * ey, rp * ex, rp * ey,
+                              float(s['motor_min_deg']), float(s['motor_max_deg']),
+                              float(s['servo_at_neutral_deg']), float(s['servo_direction']),
+                              float(s['servo_min_deg']), float(s['servo_max_deg']),
+                              int(s['channel'])))
+        self.channels = [a[12] for a in self._act]
+        self.q0 = self._ik(0.0, 0.0)
+        self.neutral = [a[8] for a in self._act]
+        self.angles = list(self.neutral)        # target angle after rate limiter
+        self.sent_angles = list(self.neutral)   # last angle actually sent over I2C
         self.last_pose = dict(kin.HOME_POSE)
         self.last_error = ''
         # No automatic motion on initialization: only command on tick.
 
-    def _servo_goal(self, pose):
-        q = kin.inverse_kinematics(pose, self.cfg)
-        goal = self.neutral + self.direction * (q - self.q0)
-        bad = (goal < self.lo) | (goal > self.hi)
-        if np.any(bad):
-            i = int(np.argmax(bad))
-            raise ValueError(f'Servo channel {self.channels[i]} command {goal[i]:.2f} '
-                             f'outside [{self.lo[i]}, {self.hi[i]}]')
+    def _ik(self, roll_deg, pitch_deg):
+        """Horn angles (deg). Same equations and checks as kin.inverse_kinematics."""
+        r, p = math.radians(roll_deg), math.radians(pitch_deg)
+        cr, sr, cp, sp = math.cos(r), math.sin(r), math.cos(p), math.sin(p)
+        L1, L2, H = self._L1, self._L2, self._H
+        q = []
+        for i, (ex, ey, bx, by, px, py, qmin, qmax, *_rest) in enumerate(self._act):
+            # P = Ry(p) Rx(r) [px, py, 0] + [0, 0, H]
+            dx = cp * px + sp * sr * py - bx
+            dy = cr * py - by
+            dz = -sp * px + cp * sr * py + H
+            A = dx * ex + dy * ey
+            K = (dx * dx + dy * dy + dz * dz + L1 * L1 - L2 * L2) / (2 * L1)
+            rho = math.hypot(A, dz)
+            if rho < 1e-9 or abs(K) > self._margin * rho:
+                raise ValueError(f'Actuator {i}: pose unreachable or near singularity')
+            ang = math.atan2(dz, A) + self._branch * math.acos(K / rho)
+            qi = math.atan2(math.sin(ang), math.cos(ang))
+            if math.cos(qi) <= 0:
+                raise ValueError(f'Actuator {i}: horn points inward; check IK branch')
+            qi = math.degrees(qi)
+            if not qmin <= qi <= qmax:
+                raise ValueError(f'Actuator {i}: motor angle {qi:.2f} outside configured limits')
+            q.append(qi)
+        return q
+
+    def _servo_goal(self, roll_deg, pitch_deg):
+        q = self._ik(roll_deg, pitch_deg)
+        goal = []
+        for i, a in enumerate(self._act):
+            cmd = a[8] + a[9] * (q[i] - self.q0[i])
+            if not a[10] <= cmd <= a[11]:
+                raise ValueError(f'Servo channel {a[12]} command {cmd:.2f} outside [{a[10]}, {a[11]}]')
+            goal.append(cmd)
         return goal
 
     def command(self, roll_deg, pitch_deg, dt):
-        pose = {'heave_mm': 0.0,
-                'roll_deg': float(roll_deg) * KINEMATICS_ANGLE_FACTOR,
-                'pitch_deg': float(pitch_deg) * KINEMATICS_ANGLE_FACTOR}
-        if max(abs(pose['roll_deg']), abs(pose['pitch_deg'])) > MAX_IK_TILT_DEG:
+        ik_roll = float(roll_deg) * KINEMATICS_ANGLE_FACTOR
+        ik_pitch = float(pitch_deg) * KINEMATICS_ANGLE_FACTOR
+        if max(abs(ik_roll), abs(ik_pitch)) > MAX_IK_TILT_DEG:
             self.last_error = 'Requested angle exceeds IK safety bound'
             return False
         try:
-            goal = self._servo_goal(pose)
+            goal = self._servo_goal(ik_roll, ik_pitch)
         except (ValueError, ArithmeticError) as exc:
             self.last_error = 'IK rejected pose: ' + str(exc)
             return False
         rate = MAX_SERVO_RATE_DPS * max(0.001, min(dt, 0.2))
-        next_angles = self.angles + np.clip(goal - self.angles, -rate, rate)
-        if self.kit:
-            for i, ch in enumerate(self.channels):
-                if abs(next_angles[i] - self.sent_angles[i]) >= SERVO_DEADBAND_DEG:
-                    self.kit.servo[ch].angle = float(next_angles[i])
-                    self.sent_angles[i] = next_angles[i]
-        self.angles = next_angles
-        self.last_pose = pose
+        for i in range(3):
+            step = min(rate, max(-rate, goal[i] - self.angles[i]))
+            nxt = self.angles[i] + step
+            if self.kit and abs(nxt - self.sent_angles[i]) >= SERVO_DEADBAND_DEG:
+                self.kit.servo[self.channels[i]].angle = nxt
+                self.sent_angles[i] = nxt
+            self.angles[i] = nxt
+        self.last_pose = {'heave_mm': 0.0, 'roll_deg': ik_roll, 'pitch_deg': ik_pitch}
         self.last_error = ''
         return True
 
@@ -236,65 +323,78 @@ class PlatformDriver:
             kin.save_pose(self.last_pose)
 
 
-class StewartBalancer:
-    def __init__(self, hardware=False, color='orange'):
+# ======================================================================
+# Shared state between the control process and the GUI process
+# ======================================================================
+FIELDS = ('alive', 'valid', 'x', 'y', 'vx', 'vy', 'roll', 'pitch', 'ref_x', 'ref_y',
+          'goal_x', 'goal_y', 'active', 'pace', 'lap', 'laps', 'running', 'stopping', 'mode',
+          'fps', 'capture_fps', 'decode_ms', 'detect_ms', 'control_ms', 'loop_ms_peak',
+          'age_ms', 'bias_x', 'bias_y', 'calibrated',
+          # preview frame block, protected by the frame_seq seqlock
+          'frame_seq', 'f_found', 'f_px', 'f_py', 'f_rad', 'f_has_mm', 'f_mmx', 'f_mmy',
+          'f_ref_x', 'f_ref_y', 'f_active')
+
+
+class S:
+    """Indices into the shared state array, e.g. state[S.X]."""
+
+
+for _i, _name in enumerate(FIELDS):
+    setattr(S, _name.upper(), _i)
+
+MODES = ('Hold', 'Point') + tuple(SHAPES)
+
+
+class Controller:
+    """Runs INSIDE the control process: camera, detection, estimation, control, servos.
+
+    Nothing here touches Tk, so GUI work can never delay a control step.
+    The GUI talks to it only through a command queue (in), an event queue
+    (out, rare messages) and shared memory (state every frame, preview frames).
+    """
+
+    def __init__(self, state, frame_buf, events, hardware=False, color='orange'):
+        sys.setswitchinterval(GIL_SWITCH_INTERVAL_S)
+        self.st = state
+        self.frame_buf = frame_buf
+        self.events = events
         self.cfg = kin.load_config()
         self.detector = BallDetector(self.cfg, color_mode=color)
         self.driver = PlatformDriver(self.cfg, hardware)
         self.pid_x, self.pid_y = AxisPID(), AxisPID()
         self.estimator = BallEstimator()
-        self.sp = np.zeros(2, float)          # displayed reference
-        self.trajectory_lock = threading.RLock()
-        self.surface_center_mm, self.surface_radius_mm = self.detector.calibration_circle_mm()
-        if np.linalg.norm(self.surface_center_mm) > 1e-3:
+        center, radius = self.detector.calibration_circle_mm()
+        if np.linalg.norm(center) > 1e-3:
             raise ValueError('Calibration circle is off-centre from platform XY origin; '
                              'trajectory planner expects concentric radial attachment points')
-        self.planner = TrajectoryPlanner(self.surface_radius_mm - BALL_EDGE_MARGIN_MM,
+        self.planner = TrajectoryPlanner(radius - BALL_EDGE_MARGIN_MM,
                                          DEFAULT_TRAJECTORY_SPEED_MM_S,
                                          DEFAULT_TRAJECTORY_ACCEL_MM_S2)
-        self.trim = np.zeros(2, float)        # physical roll, pitch degrees
+        self.trim = [0.0, 0.0]
         self.latency_comp_s = DEFAULT_LATENCY_COMP_MS / 1000.0
-        self.active = False                   # disarmed by default
-        self.position = None                  # filtered (not predicted) position
-        self.velocity = np.zeros(2)
-        self.raw = None
-        self.roll = 0.0
-        self.pitch = 0.0
-        self._u = np.zeros(2)                 # last axis outputs (ux, uy), deg
+        self.active = False
+        self.position = None
+        self.roll = self.pitch = 0.0
+        self.sp = [0.0, 0.0]
+        self._u = (0.0, 0.0)
         self.last_seen = -1e9
         self.last_step = None
-        self.fps = 0.0
-        self.capture_fps = 0.0
-        self.processing_ms = 0.0
-        self.frame_age_ms = 0.0
-        self.latest_overlay = None
-        self.latest_frame_id = 0
-        self.worker_error = ''
+        self.fps = self.capture_fps = 0.0
+        self.decode_ms = self.detect_ms = self.control_ms = 0.0
+        self._peak = self._peak_shown = 0.0
+        self._peak_t0 = time.monotonic()
+        self.preview_enabled = True
+        self._last_preview = 0.0
+        self._sent_path = None
+        self._sent_driver_error = ''
+        self._running = False
         self._frame_cond = threading.Condition()
         self._want_frame = threading.Event()
         self._frame = None
         self._frame_stamp = 0.0
         self._frame_seq = 0
-        self._overlay_cond = threading.Condition()
-        self._overlay_src = None
-        self._last_overlay_time = 0.0
-        self._running = False
-        self._threads = []
         self._last_capture_stamp = None
-        self.history = deque(maxlen=1500)
-        self.t0 = time.monotonic()
-        self.cap = self._open_camera()
-        logs = HERE / 'logs'
-        logs.mkdir(exist_ok=True)
-        self.log_path = logs / time.strftime('stewart_%Y%m%d_%H%M%S.csv')
-        # Large buffer: logging every frame costs microseconds, not disk waits.
-        self.csv_file = self.log_path.open('w', newline='', buffering=1 << 20)
-        self.writer = csv.writer(self.csv_file)
-        self.writer.writerow(['time_s', 'raw_x_mm', 'raw_y_mm', 'x_mm', 'y_mm',
-                              'vx_mm_s', 'vy_mm_s', 'ref_x_mm', 'ref_y_mm',
-                              'ref_vx_mm_s', 'ref_vy_mm_s', 'path_pace',
-                              'physical_roll_deg', 'physical_pitch_deg', 'enabled',
-                              'frame_age_ms', 'servo0_deg', 'servo1_deg', 'servo2_deg'])
+        self.cap, self.camera_info = self._open_camera()
 
     # ------------------------------------------------------------ camera
     def _open_camera(self):
@@ -316,181 +416,12 @@ class StewartBalancer:
             cap.set(cv2.CAP_PROP_EXPOSURE, CAMERA_EXPOSURE)
         code = int(cap.get(cv2.CAP_PROP_FOURCC))
         fourcc = ''.join(chr((code >> (8 * i)) & 0xFF) for i in range(4))
-        print('Camera mode:', int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), 'x',
-              int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), '@', cap.get(cv2.CAP_PROP_FPS),
-              'FPS, format', repr(fourcc), '| exposure', cap.get(cv2.CAP_PROP_EXPOSURE),
-              'auto', cap.get(cv2.CAP_PROP_AUTO_EXPOSURE))
-        return cap
-
-    # ------------------------------------------------------------ trajectory API
-    def trajectory_snapshot(self):
-        with self.trajectory_lock:
-            p = self.planner
-            return (p.display_path, p.reference.copy(), p.target.copy(),
-                    p.mode, p.running, p.status_text())
-
-    def _start_xy(self):
-        return self.position.copy() if self.position is not None else self.sp.copy()
-
-    def go_to_point(self, xy, speed=DEFAULT_TRAJECTORY_SPEED_MM_S,
-                    accel=DEFAULT_TRAJECTORY_ACCEL_MM_S2):
-        with self.trajectory_lock:
-            self.planner.point(xy, self._start_xy(), speed=speed, accel=accel)
-
-    def trace_shape(self, name, center, radius, speed=DEFAULT_TRAJECTORY_SPEED_MM_S,
-                    laps=1, accel=DEFAULT_TRAJECTORY_ACCEL_MM_S2):
-        with self.trajectory_lock:
-            self.planner.shape(name, center, radius, self._start_xy(),
-                               speed=speed, laps=laps, accel=accel)
-
-    def stop_trajectory(self, immediate=False):
-        with self.trajectory_lock:
-            self.planner.stop(immediate=immediate)
-
-    def reset_pid(self):
-        self.pid_x.reset()
-        self.pid_y.reset()
-
-    def set_active(self, active):
-        if active and self.detector.affine is None:
-            raise RuntimeError('Calibrate platform X/Y points before enabling PID')
-        self.active = bool(active)
-        self.reset_pid()
-        if not active:
-            self.stop_trajectory(immediate=True)
-
-    # ------------------------------------------------------------ control
-    def _go_level(self, dt):
-        self.reset_pid()
-        self._u[:] = 0.0
-        self.roll, self.pitch = float(self.trim[0]), float(self.trim[1])
-        self.driver.command(self.roll, self.pitch, dt)
-
-    def step(self, frame, capture_stamp):
-        """One control iteration, called ONLY by the control worker."""
-        start = time.monotonic()
-        now = capture_stamp
-        dt = 1 / 30 if self.last_step is None else min(max(now - self.last_step, 0.001), 0.2)
-        self.last_step = now
-        self.fps = 0.92 * self.fps + 0.08 / dt
-
-        result = self.detector.detect(frame, raw_frame=True)
-        measurement = result['xy_mm']
-        self.raw = measurement
-
-        est = self.estimator
-        accel_in = -BALL_ACCEL_PER_DEG * MODEL_INPUT_GAIN * self._u
-        est.predict(dt, accel_in)
-        accepted = False
-        if measurement is not None:
-            z = np.asarray(measurement, float)
-            if not est.valid:
-                est.reset(z)
-                accepted = True
-            elif np.linalg.norm(z - est.p) <= MAX_POSITION_JUMP_MM:
-                est.correct(z)
-                accepted = True
-            if accepted:
-                self.last_seen = now
-        lost = (not est.valid) or (now - self.last_seen > LOST_TIMEOUT_S)
-        if lost:
-            est.reset()
-            self.position = None
-            self.velocity = np.zeros(2)
-        else:
-            self.position = est.p.copy()
-            self.velocity = est.v.copy()
-
-        ref_v = np.zeros(2)
-        if self.active and not lost and accepted:
-            # Predict the ball to the time this command will actually act.
-            horizon = self.latency_comp_s + (time.monotonic() - capture_stamp)
-            pred_p, pred_v = est.predicted(horizon, accel_in)
-            with self.trajectory_lock:
-                ref_p, ref_v, ref_a = self.planner.update(now, pred_p, horizon)
-                self.sp[:] = self.planner.reference
-            bias = est.b if BIAS_COMPENSATION else np.zeros(2)
-            ux = self.pid_x.update(pred_p[0], pred_v[0], ref_p[0], ref_v[0], ref_a[0], dt, bias[0])
-            uy = self.pid_y.update(pred_p[1], pred_v[1], ref_p[1], ref_v[1], ref_a[1], dt, bias[1])
-            self._u[:] = (ux, uy)
-            # x error drives pitch, y error drives roll.
-            roll = ROLL_SIGN * uy + self.trim[0]
-            pitch = PITCH_SIGN * ux + self.trim[1]
-            self.roll = float(np.clip(roll, -MAX_PHYSICAL_TILT_DEG, MAX_PHYSICAL_TILT_DEG))
-            self.pitch = float(np.clip(pitch, -MAX_PHYSICAL_TILT_DEG, MAX_PHYSICAL_TILT_DEG))
-            self.driver.command(self.roll, self.pitch, dt)
-        elif self.active and not lost:
-            # One missed/rejected frame: keep the last command, don't snap level.
-            self.driver.command(self.roll, self.pitch, dt)
-        else:
-            with self.trajectory_lock:
-                self.planner.update(now, None)       # freeze the path clock
-                self.sp[:] = self.planner.reference
-            self._go_level(dt)
-
-        t = now - self.t0
-        pos = self.position
-        self.history.append((t, pos[0] if pos is not None else None,
-                             pos[1] if pos is not None else None,
-                             self.roll, self.pitch, float(self.sp[0]), float(self.sp[1])))
-        while self.history and t - self.history[0][0] > 10:
-            self.history.popleft()
-        age_ms = (time.monotonic() - capture_stamp) * 1000.0
-        self.writer.writerow([
-            round(t, 4), *(np.round(measurement, 3) if measurement is not None else ('', '')),
-            *(np.round(pos, 3) if pos is not None else ('', '')),
-            round(float(self.velocity[0]), 2), round(float(self.velocity[1]), 2),
-            round(float(self.sp[0]), 3), round(float(self.sp[1]), 3),
-            round(float(ref_v[0]), 2), round(float(ref_v[1]), 2), round(self.planner.pace, 3),
-            round(self.roll, 3), round(self.pitch, 3), int(self.active), round(age_ms, 1),
-            *np.round(self.driver.angles, 2)])
-
-        if start - self._last_overlay_time >= 1.0 / PREVIEW_HZ:
-            result.pop('mask', None)
-            with self._overlay_cond:
-                self._overlay_src = (frame, result, tuple(self.sp), self.planner.display_path)
-                self._overlay_cond.notify()
-            self._last_overlay_time = start
-
-        self.processing_ms = (time.monotonic() - start) * 1000.0
-        self.frame_age_ms = (time.monotonic() - capture_stamp) * 1000.0
-
-    # ------------------------------------------------------------ workers
-    def _overlay_loop(self):
-        """Event-driven: renders as soon as the control loop hands over a frame."""
-        while self._running:
-            with self._overlay_cond:
-                self._overlay_cond.wait_for(
-                    lambda: self._overlay_src is not None or not self._running, timeout=0.5)
-                src, self._overlay_src = self._overlay_src, None
-            if src is None:
-                continue
-            frame, result, sp, path = src
-            try:
-                corrected = self.detector.undistort(frame)
-                overlay = self.detector.draw(corrected, result, sp, path_mm=path)
-                mode = 'PID ON' if self.active else 'PAUSED / LEVEL'
-                cv2.putText(overlay, mode, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, .7,
-                            (0, 220, 0) if self.active else (0, 180, 255), 2)
-                if self.detector.affine is None:
-                    cv2.putText(overlay, 'CALIBRATE 3 PLATFORM POINTS', (12, 58),
-                                cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 0, 255), 2)
-                self.latest_overlay = overlay
-                self.latest_frame_id += 1
-            except Exception as exc:  # preview must never stop control
-                print('Preview error:', exc)
-
-    def start(self):
-        """Capture and control are independent of Tkinter redraws."""
-        if self._running:
-            return
-        self._running = True
-        self._threads = [threading.Thread(target=fn, daemon=True, name=name)
-                         for fn, name in ((self._capture_loop, 'camera'),
-                                          (self._control_loop, 'control'),
-                                          (self._overlay_loop, 'overlay'))]
-        for th in self._threads:
-            th.start()
+        info = (f'Camera {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x'
+                f'{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {cap.get(cv2.CAP_PROP_FPS):g} FPS, '
+                f'format {fourcc!r}, exposure {cap.get(cv2.CAP_PROP_EXPOSURE):g} '
+                f'(auto {cap.get(cv2.CAP_PROP_AUTO_EXPOSURE):g})')
+        print(info, flush=True)
+        return cap, info
 
     def _capture_loop(self):
         """grab() every frame to keep the driver queue empty; decode only on demand."""
@@ -508,6 +439,7 @@ class StewartBalancer:
             ok, frame = self.cap.retrieve()
             if not ok:
                 continue
+            self.decode_ms = 0.9 * self.decode_ms + 0.1 * (time.monotonic() - stamp) * 1000.0
             self._want_frame.clear()
             with self._frame_cond:
                 self._frame = frame
@@ -515,64 +447,359 @@ class StewartBalancer:
                 self._frame_seq += 1
                 self._frame_cond.notify()
 
-    def _control_loop(self):
-        last_seq = 0
-        while self._running:
-            self._want_frame.set()
-            with self._frame_cond:
-                self._frame_cond.wait_for(
-                    lambda: not self._running or self._frame_seq != last_seq,
-                    timeout=FRAME_WAIT_S)
-                if not self._running:
-                    break
-                seq, frame, stamp = self._frame_seq, self._frame, self._frame_stamp
+    # ------------------------------------------------------------ commands
+    def _start_xy(self):
+        return self.position.copy() if self.position is not None else np.array(self.sp)
+
+    def set_active(self, active):
+        if active and self.detector.affine is None:
+            raise RuntimeError('Calibrate platform X/Y points before enabling PID')
+        self.active = bool(active)
+        self.reset_pid()
+        if not active:
+            self.planner.stop(immediate=True)
+
+    def reset_pid(self):
+        self.pid_x.reset()
+        self.pid_y.reset()
+
+    def handle(self, cmd, *args):
+        if cmd == 'param':
+            key, val = args
+            if key in ('kp', 'ki', 'kd', 'kff'):
+                setattr(self.pid_x, key, float(val))
+                setattr(self.pid_y, key, float(val))
+            elif key == 'latency_ms':
+                self.latency_comp_s = float(val) / 1000.0
+            elif key == 'trim_roll':
+                self.trim[0] = float(val)
+            elif key == 'trim_pitch':
+                self.trim[1] = float(val)
+        elif cmd == 'active':
+            self.set_active(args[0])
+        elif cmd == 'point':
+            xy, speed, accel = args
+            self.planner.point(xy, self._start_xy(), speed=speed, accel=accel)
+        elif cmd == 'shape':
+            name, center, radius, speed, laps, accel = args
+            self.planner.shape(name, center, radius, self._start_xy(),
+                               speed=speed, laps=laps, accel=accel)
+        elif cmd == 'stop':
+            self.planner.stop()
+        elif cmd == 'reset_pid':
+            self.reset_pid()
+        elif cmd == 'reset_mapping':
+            self.set_active(False)
+            self.detector.reset_mapping()
+            self.estimator.reset()
+        elif cmd == 'reload_mapping':
+            self.detector.load_mapping()
+            self.estimator.reset()
+            self.position = None
+            self.reset_pid()
+        elif cmd == 'preview':
+            self.preview_enabled = bool(args[0])
+        elif cmd == 'quit':
+            self._running = False
+        else:
+            raise ValueError(f'Unknown command {cmd!r}')
+
+    def _drain_commands(self, cmd_q):
+        while True:
             try:
+                cmd = cmd_q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self.handle(*cmd)
+            except (ValueError, RuntimeError, ArithmeticError) as exc:
+                self.events.put(('error', cmd[0], str(exc)))
+
+    # ------------------------------------------------------------ control
+    def _go_level(self, dt):
+        self.reset_pid()
+        self._u = (0.0, 0.0)
+        self.roll, self.pitch = float(self.trim[0]), float(self.trim[1])
+        self.driver.command(self.roll, self.pitch, dt)
+
+    def step(self, frame, capture_stamp):
+        start = time.monotonic()
+        now = capture_stamp
+        dt = 1 / 30 if self.last_step is None else min(max(now - self.last_step, 0.001), 0.2)
+        self.last_step = now
+        self.fps = 0.92 * self.fps + 0.08 / dt
+
+        result = self.detector.detect(frame, raw_frame=True)
+        t_detect = time.monotonic()
+        measurement = result['xy_mm']
+
+        est = self.estimator
+        g = -BALL_ACCEL_PER_DEG * MODEL_INPUT_GAIN
+        accel_in = (g * self._u[0], g * self._u[1])
+        est.predict(dt, accel_in)
+        accepted = False
+        if measurement is not None:
+            if not est.valid:
+                est.reset(measurement)
+                accepted = True
+            elif est.distance_to(measurement) <= MAX_POSITION_JUMP_MM:
+                est.correct(measurement)
+                accepted = True
+            if accepted:
+                self.last_seen = now
+        lost = (not est.valid) or (now - self.last_seen > LOST_TIMEOUT_S)
+        if lost:
+            est.reset()
+            self.position = None
+        else:
+            self.position = est.p
+
+        planner = self.planner
+        if self.active and not lost and accepted:
+            # Predict the ball to the time this command will actually act.
+            horizon = self.latency_comp_s + (time.monotonic() - capture_stamp)
+            pred_p, pred_v = est.predicted(horizon, accel_in)
+            ref_p, ref_v, ref_a = planner.update(now, pred_p, horizon)
+            self.sp = [float(planner.reference[0]), float(planner.reference[1])]
+            b = est._b if BIAS_COMPENSATION else (0.0, 0.0)
+            ux = self.pid_x.update(pred_p[0], pred_v[0], ref_p[0], ref_v[0], ref_a[0], dt, b[0])
+            uy = self.pid_y.update(pred_p[1], pred_v[1], ref_p[1], ref_v[1], ref_a[1], dt, b[1])
+            self._u = (ux, uy)
+            # x error drives pitch, y error drives roll.
+            roll = ROLL_SIGN * uy + self.trim[0]
+            pitch = PITCH_SIGN * ux + self.trim[1]
+            self.roll = min(MAX_PHYSICAL_TILT_DEG, max(-MAX_PHYSICAL_TILT_DEG, roll))
+            self.pitch = min(MAX_PHYSICAL_TILT_DEG, max(-MAX_PHYSICAL_TILT_DEG, pitch))
+            self.driver.command(self.roll, self.pitch, dt)
+        elif self.active and not lost:
+            # One missed/rejected frame: keep the last command, don't snap level.
+            self.driver.command(self.roll, self.pitch, dt)
+        else:
+            planner.update(now, None)          # freeze the path clock
+            self.sp = [float(planner.reference[0]), float(planner.reference[1])]
+            self._go_level(dt)
+
+        end = time.monotonic()
+        self.detect_ms = 0.9 * self.detect_ms + 0.1 * (t_detect - start) * 1000.0
+        self.control_ms = 0.9 * self.control_ms + 0.1 * (end - t_detect) * 1000.0
+        total = (end - start) * 1000.0
+        self._peak = max(self._peak, total)
+        if end - self._peak_t0 >= 2.0:
+            self._peak_shown, self._peak, self._peak_t0 = self._peak, 0.0, end
+        self._publish(result, capture_stamp, start)
+
+    def _publish(self, result, capture_stamp, start):
+        st = self.st
+        p = self.position
+        st[S.VALID] = 0.0 if p is None else 1.0
+        if p is not None:
+            st[S.X], st[S.Y] = float(p[0]), float(p[1])
+            st[S.VX], st[S.VY] = self.estimator._v
+        st[S.ROLL], st[S.PITCH] = self.roll, self.pitch
+        st[S.REF_X], st[S.REF_Y] = self.sp
+        pl = self.planner
+        st[S.GOAL_X], st[S.GOAL_Y] = float(pl.target[0]), float(pl.target[1])
+        st[S.ACTIVE] = 1.0 if self.active else 0.0
+        st[S.PACE] = pl.pace
+        st[S.LAP], st[S.LAPS] = pl.lap, pl.laps
+        st[S.RUNNING] = 1.0 if pl.running else 0.0
+        st[S.STOPPING] = 1.0 if pl.stopping else 0.0
+        st[S.MODE] = MODES.index(pl.mode) if pl.mode in MODES else 0
+        st[S.FPS], st[S.CAPTURE_FPS] = self.fps, self.capture_fps
+        st[S.DECODE_MS], st[S.DETECT_MS], st[S.CONTROL_MS] = self.decode_ms, self.detect_ms, self.control_ms
+        st[S.LOOP_MS_PEAK] = self._peak_shown
+        st[S.AGE_MS] = (time.monotonic() - capture_stamp) * 1000.0
+        st[S.BIAS_X], st[S.BIAS_Y] = self.estimator._b
+        st[S.CALIBRATED] = 0.0 if self.detector.affine is None else 1.0
+        # Rare messages only when something actually changed.
+        if pl.display_path is not self._sent_path:
+            self._sent_path = pl.display_path
+            self.events.put(('path', np.array(pl.display_path)))
+        if self.driver.last_error != self._sent_driver_error:
+            self._sent_driver_error = self.driver.last_error
+            self.events.put(('driver_error', self.driver.last_error))
+        # Preview: a ~1 MB memcpy a few times a second; all drawing is done by the GUI.
+        if (self.preview_enabled and self.frame_buf is not None
+                and start - self._last_preview >= 1.0 / PREVIEW_HZ):
+            self._last_preview = start
+            seq = st[S.FRAME_SEQ]
+            st[S.FRAME_SEQ] = seq + 1                    # odd: writing
+            np.copyto(self.frame_buf, self._frame_for_preview)
+            found = result['found']
+            st[S.F_FOUND] = 1.0 if found else 0.0
+            if found:
+                st[S.F_PX], st[S.F_PY] = result['pixel']
+                st[S.F_RAD] = result['radius_px']
+                mm = result['xy_mm']
+                st[S.F_HAS_MM] = 0.0 if mm is None else 1.0
+                if mm is not None:
+                    st[S.F_MMX], st[S.F_MMY] = mm
+            st[S.F_REF_X], st[S.F_REF_Y] = self.sp
+            st[S.F_ACTIVE] = st[S.ACTIVE]
+            st[S.FRAME_SEQ] = seq + 2                    # even: complete
+
+    # ------------------------------------------------------------ main loop
+    def run(self, cmd_q):
+        self._running = True
+        cap_thread = threading.Thread(target=self._capture_loop, daemon=True, name='camera')
+        cap_thread.start()
+        self.st[S.ALIVE] = 1.0
+        parent = mp.parent_process()
+        last_seq = 0
+        last_parent_check = time.monotonic()
+        try:
+            while self._running:
+                self._drain_commands(cmd_q)
+                self._want_frame.set()
+                with self._frame_cond:
+                    self._frame_cond.wait_for(lambda: self._frame_seq != last_seq,
+                                              timeout=FRAME_WAIT_S)
+                    seq, frame, stamp = self._frame_seq, self._frame, self._frame_stamp
+                now = time.monotonic()
+                if now - last_parent_check > 1.0:
+                    last_parent_check = now
+                    if parent is not None and not parent.is_alive():
+                        break                       # GUI died: level and exit
                 if seq == last_seq or frame is None:
                     # Camera stalled. Hold briefly, then level once the ball is "lost".
-                    if time.monotonic() - self.last_seen > LOST_TIMEOUT_S:
+                    if now - self.last_seen > LOST_TIMEOUT_S:
                         self.position = None
                         self.estimator.reset()
                         self._go_level(FRAME_WAIT_S)
+                        self.st[S.VALID] = 0.0
                     continue
                 last_seq = seq
+                self._frame_for_preview = frame
                 self.step(frame, stamp)
-            except Exception as exc:
-                self.active = False
-                self.worker_error = f'{type(exc).__name__}: {exc}'
-                self.position = None
-                self.reset_pid()
-                try:
-                    self.driver.command(float(self.trim[0]), float(self.trim[1]), 0.05)
-                except Exception:
-                    pass
-                self._running = False
-                break
-
-    def stop(self):
-        self._running = False
-        with self._frame_cond:
-            self._frame_cond.notify_all()
-        with self._overlay_cond:
-            self._overlay_cond.notify_all()
-        for th in self._threads:
-            th.join(timeout=1.0)
-
-    def history_snapshot(self):
-        try:
-            return list(self.history)
-        except RuntimeError:
-            return []
+        finally:
+            self._running = False
+            cap_thread.join(timeout=1.0)
 
     def close(self):
-        self.stop()
+        self._running = False
         self.active = False
         try:
             self.driver.command(float(self.trim[0]), float(self.trim[1]), 0.2)
             self.driver.close()
         finally:
             self.cap.release()
-            self.csv_file.close()
-            print('CSV log:', self.log_path)
+
+
+def _pin_to_cpus(cpus):
+    if PIN_CPUS:
+        try:
+            available = os.sched_getaffinity(0)
+            chosen = set(cpus) & available
+            if chosen and len(available) >= 4:
+                os.sched_setaffinity(0, chosen)
+        except (AttributeError, OSError):
+            pass
+
+
+def control_process_main(state, frame_raw, shape, cmd_q, events, hardware, color):
+    """Entry point of the control process."""
+    cv2.setNumThreads(1)
+    _pin_to_cpus(CONTROL_CPUS)
+    frame_buf = np.frombuffer(frame_raw, dtype=np.uint8).reshape(shape)
+    ctrl = None
+    try:
+        ctrl = Controller(state, frame_buf, events, hardware, color)
+        events.put(('ready', ctrl.camera_info))
+        ctrl.run(cmd_q)
+    except Exception as exc:
+        traceback.print_exc()
+        events.put(('fatal', f'{type(exc).__name__}: {exc}'))
+    finally:
+        try:
+            if ctrl is not None:
+                ctrl.close()
+        finally:
+            state[S.ALIVE] = 0.0
+
+
+class BalancerClient:
+    """GUI-side handle to the control process."""
+
+    def __init__(self, hardware=False, color='orange'):
+        ctx = mp.get_context('spawn')
+        self.cfg = kin.load_config()
+        self.hardware = hardware
+        # A detector copy in THIS process for preview drawing and calibration clicks.
+        self.detector = BallDetector(self.cfg, color_mode=color)
+        center, radius = self.detector.calibration_circle_mm()
+        self.surface_center_mm, self.surface_radius_mm = center, radius
+        self.limit = radius - BALL_EDGE_MARGIN_MM
+        w, h = self.detector.size
+        self.frame_shape = (h, w, 3)
+        self.state = ctx.RawArray('d', len(FIELDS))
+        self._frame_raw = ctx.RawArray('B', h * w * 3)
+        self._frame = np.frombuffer(self._frame_raw, dtype=np.uint8).reshape(self.frame_shape)
+        self.cmd_q = ctx.Queue()
+        self.events = ctx.Queue()
+        self.proc = ctx.Process(target=control_process_main, name='balancer-control',
+                                args=(self.state, self._frame_raw, self.frame_shape,
+                                      self.cmd_q, self.events, hardware, color))
+        self.proc.start()
+        _pin_to_cpus(GUI_CPUS)
+        self._last_frame_seq = 0.0
+
+    def send(self, *cmd):
+        self.cmd_q.put(cmd)
+
+    def __getitem__(self, idx):
+        return self.state[idx]
+
+    def poll_events(self):
+        out = []
+        while True:
+            try:
+                out.append(self.events.get_nowait())
+            except queue.Empty:
+                return out
+
+    def alive(self):
+        return self.proc.is_alive()
+
+    def read_frame(self):
+        """Newest preview frame (copy) + its detection result, or None if nothing new."""
+        st = self.state
+        seq = st[S.FRAME_SEQ]
+        if seq == self._last_frame_seq or int(seq) % 2:
+            return None
+        frame = self._frame.copy()
+        found = st[S.F_FOUND] > 0.5
+        result = {'found': found,
+                  'pixel': (st[S.F_PX], st[S.F_PY]) if found else None,
+                  'radius_px': st[S.F_RAD] if found else None,
+                  'xy_mm': (st[S.F_MMX], st[S.F_MMY]) if found and st[S.F_HAS_MM] > 0.5 else None}
+        ref = (st[S.F_REF_X], st[S.F_REF_Y])
+        active = st[S.F_ACTIVE] > 0.5
+        if st[S.FRAME_SEQ] != seq:
+            return None                      # overwritten while copying; skip
+        self._last_frame_seq = seq
+        return frame, result, ref, active
+
+    def close(self, timeout=5.0):
+        if self.proc.is_alive():
+            self.send('quit')
+            self.proc.join(timeout)
+        if self.proc.is_alive():
+            self.proc.terminate()
+            self.proc.join(1.0)
+
+
+def render_preview(detector, frame, result, ref, active, path, scale):
+    """Undistort + draw overlays for display (runs in the GUI process)."""
+    img = detector.undistort(frame, scale)
+    detector.draw(img, result, ref, path_mm=path, scale=scale)
+    k = max(scale, 0.6)
+    thick = 2 if scale >= 0.75 else 1
+    cv2.putText(img, 'PID ON' if active else 'PAUSED / LEVEL', (8, int(26 * k)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7 * k, (0, 220, 0) if active else (0, 180, 255), thick)
+    if detector.affine is None:
+        cv2.putText(img, 'CALIBRATE 3 PLATFORM POINTS', (8, int(54 * k)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7 * k, (0, 0, 255), thick)
+    return img
 
 
 def main():
@@ -581,25 +808,28 @@ def main():
     parser.add_argument('--headless', action='store_true', help='OpenCV monitor without Tk GUI; PID disabled')
     parser.add_argument('--color', choices=['orange', 'white'], default='orange')
     args = parser.parse_args()
-    ctrl = StewartBalancer(hardware=args.hardware, color=args.color)
+    client = BalancerClient(hardware=args.hardware, color=args.color)
     try:
         if args.headless:
             print('Headless monitoring only; PID remains disabled. Press q to exit.')
-            ctrl.start()
-            last_id = -1
+            path = None
             while True:
-                if ctrl.latest_frame_id != last_id and ctrl.latest_overlay is not None:
-                    last_id = ctrl.latest_frame_id
-                    cv2.imshow('Stewart Ball Camera', ctrl.latest_overlay)
-                if ctrl.worker_error:
-                    raise RuntimeError(ctrl.worker_error)
-                if cv2.waitKey(10) & 0xff == ord('q'):
+                for ev in client.poll_events():
+                    if ev[0] == 'fatal':
+                        raise RuntimeError(ev[1])
+                    if ev[0] == 'path':
+                        path = ev[1]
+                got = client.read_frame()
+                if got is not None:
+                    cv2.imshow('Stewart Ball Camera',
+                               render_preview(client.detector, *got, path, 1.0))
+                if cv2.waitKey(30) & 0xff == ord('q') or not client.alive():
                     break
         else:
             from stewart_balancer_gui import BalancerGUI
-            BalancerGUI(ctrl).run()
+            BalancerGUI(client).run()
     finally:
-        ctrl.close()
+        client.close()
         cv2.destroyAllWindows()
 
 

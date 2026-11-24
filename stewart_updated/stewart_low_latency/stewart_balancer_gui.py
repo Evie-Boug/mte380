@@ -1,10 +1,16 @@
-"""Tk GUI: camera view, top-down X/Y platform, history plots, gains and trajectory planning.
+"""Tk GUI for the ball balancer. Runs in the MAIN process; control runs in its own process.
 
-Latency notes: the GUI polls every 40 ms and only does cheap work per tick.
-The camera image is pasted into ONE persistent PhotoImage (no new Tk image per
-frame), platform markers are moved with coords() instead of delete/re-create,
-and the history chart redraws at 4 Hz.
+Nothing here can slow the control loop: the GUI only reads shared memory and
+sends commands. Its own CPU use is kept small anyway so the buttons stay
+responsive on a Pi 4:
+  * 10 Hz tick; sliders push values only when moved;
+  * camera preview rendered in a background thread at half size
+    (full size while calibrating) and can be switched off;
+  * graphs are OFF by default; when on, they sample at the GUI rate and
+    redraw twice a second.
 """
+from collections import deque
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -13,29 +19,37 @@ import cv2
 from PIL import Image, ImageTk
 import numpy as np
 
-from stewart_ball_balancer import (MAX_PHYSICAL_TILT_DEG, KINEMATICS_ANGLE_FACTOR,
-                                   DEFAULT_TRAJECTORY_SPEED_MM_S,
-                                   DEFAULT_TRAJECTORY_ACCEL_MM_S2,
-                                   DEFAULT_LATENCY_COMP_MS, KFF)
+from stewart_ball_balancer import (S, MODES, MAX_PHYSICAL_TILT_DEG, KINEMATICS_ANGLE_FACTOR,
+                                   DEFAULT_TRAJECTORY_SPEED_MM_S, DEFAULT_TRAJECTORY_ACCEL_MM_S2,
+                                   DEFAULT_LATENCY_COMP_MS, KP, KI, KD, KFF,
+                                   PREVIEW_HZ, PREVIEW_SCALE, render_preview)
 from trajectory_planner import SHAPES
 
-GUI_PERIOD_MS = 40
-CHART_PERIOD_S = 0.25
+GUI_PERIOD_MS = 100
+CHART_PERIOD_S = 0.5
+CHART_SECONDS = 10.0
 PW, PH = 430, 295        # platform canvas
 CW, CH = 430, 170        # chart canvas
 
 
 class BalancerGUI:
-    def __init__(self, controller):
-        self.c = controller
+    def __init__(self, client):
+        self.c = client
+        self.det = client.detector
         self.root = tk.Tk()
         self.root.title('Stewart Platform Ball Balancer')
         self.root.protocol('WM_DELETE_WINDOW', self.root.quit)
         self.calibrating = False
-        self.last_display_id = -1
-        self._last_chart_draw = 0.0
-        self._last_path_signature = None
+        self._path = np.zeros((1, 2))
+        self._path_drawn = None
         self._label_cache = {}
+        self._history = deque()
+        self._last_chart_draw = 0.0
+        self._rendered = None
+        self._rendered_id = 0
+        self._shown_id = 0
+        self._render_running = True
+        self.camera_info = 'Starting camera...'
 
         left = ttk.Frame(self.root)
         left.grid(row=0, column=0, padx=12, pady=8, sticky='n')
@@ -43,16 +57,29 @@ class BalancerGUI:
         right.grid(row=0, column=1, padx=12, pady=8, sticky='n')
 
         # ---------------- left: camera + gains ----------------
-        w, h = self.c.detector.size
-        ttk.Label(left, text='Camera (intrinsics corrected)').pack(anchor='w')
-        self.camera = tk.Canvas(left, width=w, height=h, bg='black', highlightthickness=0)
-        self.camera.pack()
-        self.photo = ImageTk.PhotoImage('RGB', (w, h))
-        self.camera.create_image(0, 0, image=self.photo, anchor='nw')
+        top = ttk.Frame(left)
+        top.pack(fill='x')
+        ttk.Label(top, text='Camera (intrinsics corrected)').pack(side='left')
+        self.show_camera = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text='Camera preview', variable=self.show_camera,
+                        command=self._camera_toggled).pack(side='left', padx=12)
+        self.show_graphs = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text='Graphs', variable=self.show_graphs,
+                        command=self._graphs_toggled).pack(side='left')
+        self.camera = tk.Canvas(left, bg='black', highlightthickness=0)
+        self.camera.pack(anchor='w')
+        self.photo = None
+        self._photo_size = None
+        self._image_item = self.camera.create_image(0, 0, anchor='nw')
+        self._camera_off_text = self.camera.create_text(10, 10, anchor='nw', fill='#aaa',
+                                                        text='', font=('TkDefaultFont', 11))
+        self._set_preview_scale(PREVIEW_SCALE)
         self.camera.bind('<Button-1>', self.click_camera)
         self.status = ttk.Label(left, text='', width=95)
-        self.status.pack(anchor='w', pady=4)
-        self.mapping_label = ttk.Label(left, text='', wraplength=w)
+        self.status.pack(anchor='w', pady=(4, 0))
+        self.timing = ttk.Label(left, text='', width=95)
+        self.timing.pack(anchor='w')
+        self.mapping_label = ttk.Label(left, text='', wraplength=640)
         self.mapping_label.pack(anchor='w')
         ttk.Button(left, text='Calibrate 3 platform points',
                    command=self.start_calibration).pack(anchor='w', pady=4)
@@ -60,28 +87,26 @@ class BalancerGUI:
         self.vars, self.numbers = {}, {}
         sliders = ttk.LabelFrame(left, text='Controller (both axes share gains)')
         sliders.pack(fill='x', pady=4)
-        params = [
-            ('kp', 'Kp [deg/mm]', 0, .20, self.c.pid_x.kp),
-            ('ki', 'Ki [deg/(mm s)]', 0, .08, self.c.pid_x.ki),
-            ('kd', 'Kd [deg s/mm]', 0, .12, self.c.pid_x.kd),
-            ('kff', 'Accel feed-forward', 0, 2.0, KFF),
-            ('latency', 'Latency comp [ms]', 0, 200, DEFAULT_LATENCY_COMP_MS),
-            ('trim_roll', 'Roll trim [deg]', -2, 2, 0),
-            ('trim_pitch', 'Pitch trim [deg]', -2, 2, 0),
-        ]
-        for i, (key, label, low, high, initial) in enumerate(params):
-            self._slider(sliders, i, key, label, low, high, initial, 300)
+        for i, (key, label, low, high, initial) in enumerate([
+                ('kp', 'Kp [deg/mm]', 0, .20, KP),
+                ('ki', 'Ki [deg/(mm s)]', 0, .08, KI),
+                ('kd', 'Kd [deg s/mm]', 0, .12, KD),
+                ('kff', 'Accel feed-forward', 0, 2.0, KFF),
+                ('latency_ms', 'Latency comp [ms]', 0, 200, DEFAULT_LATENCY_COMP_MS),
+                ('trim_roll', 'Roll trim [deg]', -2, 2, 0),
+                ('trim_pitch', 'Pitch trim [deg]', -2, 2, 0)]):
+            self._slider(sliders, i, key, label, low, high, initial, 300, send=True)
 
         # ---------------- right: views + planning ----------------
         ttk.Label(right, text='Top view (X/Y in mm)').pack(anchor='w')
         self.platform = tk.Canvas(right, width=PW, height=PH, bg='white')
         self.platform.pack()
         self.platform.bind('<Button-1>', self.click_platform)
-        ttk.Label(right, text='Last 10 s: X, Y (dashed = reference) and physical roll/pitch').pack(anchor='w')
+        self.chart_title = ttk.Label(right, text='Last 10 s: X, Y (dashed = reference) and roll/pitch')
         self.chart = tk.Canvas(right, width=CW, height=CH, bg='white')
-        self.chart.pack()
 
         plan = ttk.LabelFrame(right, text='Trajectory planning')
+        self.plan_frame = plan
         plan.pack(fill='x', pady=4)
         ttk.Label(plan, text='Shape').grid(row=0, column=0, padx=5, sticky='w')
         self.shape_var = tk.StringVar(value='Circle')
@@ -102,7 +127,7 @@ class BalancerGUI:
         buttons.grid(row=6, column=0, columnspan=4, pady=5)
         ttk.Button(buttons, text='Go to point', command=self.go_to_point).pack(side='left', padx=3)
         ttk.Button(buttons, text='Trace shape', command=self.trace_shape).pack(side='left', padx=3)
-        ttk.Button(buttons, text='Stop path', command=self.c.stop_trajectory).pack(side='left', padx=3)
+        ttk.Button(buttons, text='Stop path', command=lambda: self.c.send('stop')).pack(side='left', padx=3)
         self.plan_status = ttk.Label(plan, text='Hold')
         self.plan_status.grid(row=7, column=0, columnspan=4, sticky='w')
         ttk.Label(plan, text='Click top view to choose a goal; shape centre = (0,0).').grid(
@@ -112,61 +137,111 @@ class BalancerGUI:
         actions.pack(pady=6)
         self.toggle_button = ttk.Button(actions, text='Enable PID', command=self.toggle)
         self.toggle_button.pack(side='left', padx=5)
-        ttk.Button(actions, text='Reset integral', command=self.c.reset_pid).pack(side='left', padx=5)
+        ttk.Button(actions, text='Reset integral',
+                   command=lambda: self.c.send('reset_pid')).pack(side='left', padx=5)
         ttk.Button(actions, text='Quit', command=self.root.quit).pack(side='left', padx=5)
-        ttk.Label(right, text='HARDWARE ENABLED' if self.c.driver.hardware
+        ttk.Label(right, text='HARDWARE ENABLED' if self.c.hardware
                   else 'DRY RUN: no motor commands sent').pack(anchor='w')
         ttk.Label(right, text=f'Temporary IK angle factor = {KINEMATICS_ANGLE_FACTOR:g}x | '
                   f'max physical angle = {MAX_PHYSICAL_TILT_DEG:g} deg').pack(anchor='w')
 
         self._build_platform_items()
         self._build_chart_grid()
+        self._render_thread = threading.Thread(target=self._render_loop, daemon=True,
+                                               name='preview-render')
 
-    def _slider(self, parent, row, key, label, low, high, initial, length, fmt='{:+.3f}'):
-        self.vars[key] = tk.DoubleVar(value=initial)
+    # ---------------------------------------------------------------- widgets
+    def _slider(self, parent, row, key, label, low, high, initial, length,
+                fmt='{:+.3f}', send=False):
+        var = self.vars[key] = tk.DoubleVar(value=initial)
         ttk.Label(parent, text=label, width=23).grid(row=row, column=0, sticky='w', padx=5)
-        ttk.Scale(parent, from_=low, to=high, variable=self.vars[key], length=length).grid(
+        ttk.Scale(parent, from_=low, to=high, variable=var, length=length).grid(
             row=row, column=1, columnspan=2, sticky='w')
-        lbl = ttk.Label(parent, text='', width=8)
+        lbl = ttk.Label(parent, text=fmt.format(initial), width=8)
         lbl.grid(row=row, column=3)
         self.numbers[key] = (lbl, fmt)
+        var.trace_add('write', lambda *_: self._on_slider(key, send))
+        if send:
+            self.c.send('param', key, float(initial))
+
+    def _on_slider(self, key, send):
+        try:
+            val = self.vars[key].get()
+        except tk.TclError:
+            return
+        lbl, fmt = self.numbers[key]
+        lbl.configure(text=fmt.format(val))
+        if send:
+            self.c.send('param', key, val)
+
+    def _set_text(self, widget, text, item=None):
+        key = (str(widget), item)
+        if self._label_cache.get(key) != text:
+            self._label_cache[key] = text
+            if item is None:
+                widget.configure(text=text)
+            else:
+                widget.itemconfigure(item, text=text)
+
+    # ---------------------------------------------------------------- toggles
+    def _set_preview_scale(self, scale):
+        self.preview_scale = scale
+        w, h = self.det.size
+        self.camera.configure(width=int(round(w * scale)), height=int(round(h * scale)))
+
+    def _camera_toggled(self):
+        on = self.show_camera.get() or self.calibrating
+        self.c.send('preview', on)
+        self.camera.itemconfigure(self._image_item, state='normal' if on else 'hidden')
+        self.camera.itemconfigure(self._camera_off_text,
+                                  text='' if on else 'Camera preview off (saves CPU)')
+
+    def _graphs_toggled(self):
+        if self.show_graphs.get():
+            self._history.clear()
+            self.chart_title.pack(anchor='w', before=self.plan_frame)
+            self.chart.pack(before=self.plan_frame)
+        else:
+            self.chart.delete('data')
+            self.chart.pack_forget()
+            self.chart_title.pack_forget()
+            self._history.clear()
 
     # ---------------------------------------------------------------- actions
     def start_calibration(self):
-        if self.c.active:
-            self.c.set_active(False)
-            self.toggle_button.configure(text='Enable PID')
-        self.c.detector.reset_mapping()
+        self.c.send('reset_mapping')            # also disables PID in the control process
+        self.det.reset_mapping()
         self.calibrating = True
-        self.mapping_label.configure(text='Click platform attachment 1, 2, 3 IN THE ORDER of geometry.radial_angles_deg '
-                                     '(default: top, bottom-right, bottom-left). Use the level pose.')
+        self._set_preview_scale(1.0)            # full resolution for accurate clicks
+        self._camera_toggled()
+        self.mapping_label.configure(text='Click platform attachment 1, 2, 3 IN THE ORDER of '
+                                     'geometry.radial_angles_deg (default: top, bottom-right, '
+                                     'bottom-left). Use the level pose.')
 
     def click_camera(self, event):
         if not self.calibrating:
             return
+        s = self.preview_scale
         try:
-            n = self.c.detector.add_reference_click(event.x, event.y)
+            n = self.det.add_reference_click(event.x / s, event.y / s)
         except ValueError as e:
             messagebox.showerror('Calibration', str(e))
             return
         if n == 3:
             self.calibrating = False
-            self.c.position = None
-            self.c.estimator.reset()
-            self.c.reset_pid()
-            self.mapping_label.configure(text='Mapping saved. Confirm X/Y axes and measurement before enabling PID.')
+            self._set_preview_scale(PREVIEW_SCALE)
+            self._camera_toggled()
+            self.c.send('reload_mapping')       # control process reads the saved mapping
+            self.mapping_label.configure(text='Mapping saved. Confirm X/Y axes and measurement '
+                                         'before enabling PID.')
         else:
             self.mapping_label.configure(text=f'Click platform attachment point {n+1} of 3.')
 
     def toggle(self):
-        try:
-            self.c.set_active(not self.c.active)
-            self.toggle_button.configure(text='Pause (level)' if self.c.active else 'Enable PID')
-        except RuntimeError as e:
-            messagebox.showwarning('Cannot enable PID', str(e))
+        self.c.send('active', self.c[S.ACTIVE] < 0.5)
 
     def _scale(self):
-        return min(190, 128) / self.c.surface_radius_mm
+        return 128.0 / self.c.surface_radius_mm
 
     def coordinate(self, x, y):
         s = self._scale()
@@ -175,20 +250,17 @@ class BalancerGUI:
     def click_platform(self, event):
         s = self._scale()
         xy = np.array([(event.x - 215) / s, (147 - event.y) / s])
-        limit = self.c.planner.limit
         length = np.linalg.norm(xy)
-        if length > limit:
-            xy *= limit / length
+        if length > self.c.limit:
+            xy *= self.c.limit / length
         self.vars['target_x'].set(float(xy[0]))
         self.vars['target_y'].set(float(xy[1]))
         self.go_to_point()
 
     def go_to_point(self):
-        try:
-            self.c.go_to_point((self.vars['target_x'].get(), self.vars['target_y'].get()),
-                               self.vars['speed'].get(), self.vars['accel'].get())
-        except ValueError as exc:
-            messagebox.showwarning('Invalid trajectory', str(exc))
+        v = self.vars
+        self.c.send('point', (v['target_x'].get(), v['target_y'].get()),
+                    v['speed'].get(), v['accel'].get())
 
     def trace_shape(self):
         try:
@@ -196,11 +268,9 @@ class BalancerGUI:
         except (tk.TclError, ValueError):
             messagebox.showwarning('Invalid laps', 'Laps must be a whole number 1-99')
             return
-        try:
-            self.c.trace_shape(self.shape_var.get(), (0.0, 0.0), self.vars['radius'].get(),
-                               self.vars['speed'].get(), laps, self.vars['accel'].get())
-        except ValueError as exc:
-            messagebox.showwarning('Invalid trajectory', str(exc))
+        v = self.vars
+        self.c.send('shape', self.shape_var.get(), (0.0, 0.0), v['radius'].get(),
+                    v['speed'].get(), laps, v['accel'].get())
 
     # ---------------------------------------------------------------- drawing
     def _build_platform_items(self):
@@ -208,9 +278,9 @@ class BalancerGUI:
         cx, cy = self.coordinate(*c.surface_center_mm)
         r = self.coordinate(c.surface_radius_mm, 0)[0] - cx
         cv.create_oval(cx-r, cy-r, cx+r, cy+r, outline='#415a77', fill='#e7eef3', width=2)
-        safe_r = self.coordinate(c.planner.limit, 0)[0] - cx
+        safe_r = self.coordinate(c.limit, 0)[0] - cx
         cv.create_oval(cx-safe_r, cy-safe_r, cx+safe_r, cy+safe_r, outline='#a1b2bc', dash=(4, 4))
-        for x, y in c.detector.target_points_mm():
+        for x, y in self.det.target_points_mm():
             ax, ay = self.coordinate(x, y)
             cv.create_oval(ax-3, ay-3, ax+3, ay+3, fill='#415a77', outline='')
         x0, y0 = self.coordinate(0, 0)
@@ -225,39 +295,27 @@ class BalancerGUI:
                                     state='hidden', tags='dyn')
         self._legend = cv.create_text(8, 282, anchor='w', fill='#333', tags='dyn')
 
-    def draw_platform(self, snapshot):
+    def draw_platform(self, st, mode):
         cv = self.platform
-        path, reference, goal, mode, running, _ = snapshot
-        signature = (id(path), mode)
-        if signature != self._last_path_signature:
+        if self._path is not self._path_drawn:
             cv.delete('path')
-            if len(path) > 1:
-                coords = [v for pt in path for v in self.coordinate(*pt)]
+            if len(self._path) > 1:
+                coords = [v for pt in self._path for v in self.coordinate(*pt)]
                 cv.create_line(*coords, fill='#6b69ba', width=2, tags='path')
                 cv.tag_raise('dyn')
-            self._last_path_signature = signature
-        gx, gy = self.coordinate(*goal)
+            self._path_drawn = self._path
+        gx, gy = self.coordinate(st[S.GOAL_X], st[S.GOAL_Y])
         cv.coords(self._goal, gx-5, gy-5, gx+5, gy+5)
-        sx, sy = self.coordinate(*reference)
+        sx, sy = self.coordinate(st[S.REF_X], st[S.REF_Y])
         cv.coords(self._ref_h, sx-8, sy, sx+8, sy)
         cv.coords(self._ref_v, sx, sy-8, sx, sy+8)
-        p = self.c.position
-        if p is None:
-            cv.itemconfigure(self._ball, state='hidden')
-        else:
-            bx, by = self.coordinate(*p)
+        if st[S.VALID] > 0.5:
+            bx, by = self.coordinate(st[S.X], st[S.Y])
             cv.coords(self._ball, bx-10, by-10, bx+10, by+10)
             cv.itemconfigure(self._ball, state='normal')
-        self._set_text(cv, self._legend, f'Yellow: ball  Green: reference  Purple: path  [{mode}]')
-
-    def _set_text(self, widget, item, text):
-        key = (str(widget), item)
-        if self._label_cache.get(key) != text:
-            self._label_cache[key] = text
-            if item is None:
-                widget.configure(text=text)
-            else:
-                widget.itemconfigure(item, text=text)
+        else:
+            cv.itemconfigure(self._ball, state='hidden')
+        self._set_text(cv, f'Yellow: ball  Green: reference  Purple: path  [{mode}]', self._legend)
 
     def _build_chart_grid(self):
         cv = self.chart
@@ -270,17 +328,13 @@ class BalancerGUI:
     def draw_chart(self):
         cv = self.chart
         cv.delete('data')
-        hist = self.c.history_snapshot()
-        if not hist:
+        hist = self._history
+        if len(hist) < 2:
             return
-        if len(hist) > 160:
-            hist = hist[::max(1, len(hist) // 160)] + [hist[-1]]
         end = hist[-1][0]
-        xy_scale = self.c.surface_radius_mm
-        lanes = [(5, xy_scale, '#285d81', 0, (4, 3), 1),
-                 (6, xy_scale, '#d37a2c', 0, (4, 3), 1),
-                 (1, xy_scale, '#285d81', 0, None, 2),
-                 (2, xy_scale, '#d37a2c', 0, None, 2),
+        r = self.c.surface_radius_mm
+        lanes = [(5, r, '#285d81', 0, (4, 3), 1), (6, r, '#d37a2c', 0, (4, 3), 1),
+                 (1, r, '#285d81', 0, None, 2), (2, r, '#d37a2c', 0, None, 2),
                  (3, MAX_PHYSICAL_TILT_DEG, '#2a9d8f', 85, None, 2),
                  (4, MAX_PHYSICAL_TILT_DEG, '#ae4b75', 85, None, 2)]
         for idx, scale, color, top, dash, width in lanes:
@@ -292,58 +346,111 @@ class BalancerGUI:
                         cv.create_line(*seg, fill=color, width=width, dash=dash, tags='data')
                     seg = []
                     continue
-                seg += [CW * (1 - (end - h[0]) / 10), top + 43 - 36 * v / scale]
+                seg += [CW * (1 - (end - h[0]) / CHART_SECONDS), top + 43 - 36 * v / scale]
             if len(seg) >= 4:
                 cv.create_line(*seg, fill=color, width=width, dash=dash, tags='data')
 
+    # ---------------------------------------------------------------- preview
+    def _render_loop(self):
+        """Background thread: copy + undistort + draw (OpenCV releases the GIL)."""
+        while self._render_running:
+            time.sleep(0.5 / PREVIEW_HZ)
+            if not (self.show_camera.get() or self.calibrating):
+                continue
+            got = self.c.read_frame()
+            if got is None:
+                continue
+            try:
+                img = render_preview(self.det, *got, self._path, self.preview_scale)
+                self._rendered = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                self._rendered_id += 1
+            except Exception:
+                pass                        # e.g. mapping being reset mid-draw
+
     def _update_camera(self):
-        frame = self.c.latest_overlay
-        fid = self.c.latest_frame_id
-        if frame is None or fid == self.last_display_id:
+        rgb = self._rendered
+        if rgb is None or self._rendered_id == self._shown_id:
             return
-        self.photo.paste(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-        self.last_display_id = fid
+        self._shown_id = self._rendered_id
+        size = (rgb.shape[1], rgb.shape[0])
+        if size != self._photo_size:
+            self.photo = ImageTk.PhotoImage('RGB', size)
+            self.camera.itemconfigure(self._image_item, image=self.photo)
+            self._photo_size = size
+        self.photo.paste(Image.fromarray(rgb))
 
     # ---------------------------------------------------------------- loop
+    def _handle_events(self):
+        for ev in self.c.poll_events():
+            kind = ev[0]
+            if kind == 'path':
+                self._path = ev[1]
+            elif kind == 'ready':
+                self.camera_info = ev[1]
+            elif kind == 'error':
+                title = {'active': 'Cannot enable PID'}.get(ev[1], 'Invalid trajectory'
+                                                           if ev[1] in ('point', 'shape') else ev[1])
+                messagebox.showwarning(title, ev[2])
+            elif kind == 'driver_error':
+                if ev[1]:
+                    self.mapping_label.configure(text=ev[1])
+            elif kind == 'fatal':
+                raise RuntimeError(ev[1])
+
     def tick(self):
         try:
-            c, v = self.c, self.vars
-            c.pid_x.kp = c.pid_y.kp = v['kp'].get()
-            c.pid_x.ki = c.pid_y.ki = v['ki'].get()
-            c.pid_x.kd = c.pid_y.kd = v['kd'].get()
-            c.pid_x.kff = c.pid_y.kff = v['kff'].get()
-            c.latency_comp_s = v['latency'].get() / 1000.0
-            c.trim[:] = [v['trim_roll'].get(), v['trim_pitch'].get()]
-            for key, (lbl, fmt) in self.numbers.items():
-                self._set_text(lbl, None, fmt.format(v[key].get()))
-            if c.worker_error:
-                raise RuntimeError(c.worker_error)
+            self._handle_events()
+            if not self.c.alive():
+                raise RuntimeError('Control process exited')
+            st = self.c.state
             self._update_camera()
-            snapshot = c.trajectory_snapshot()
-            self.draw_platform(snapshot)
-            self._set_text(self.plan_status, None, snapshot[5])
-            now = time.monotonic()
-            if now - self._last_chart_draw >= CHART_PERIOD_S:
-                self.draw_chart()
-                self._last_chart_draw = now
-            p = c.position
-            pos = 'NO BALL' if p is None else f'X={p[0]:+.1f}, Y={p[1]:+.1f} mm'
-            self._set_text(self.status, None,
-                           f'{pos} | vx={c.velocity[0]:+.0f} vy={c.velocity[1]:+.0f} mm/s | '
-                           f'roll={c.roll:+.2f} pitch={c.pitch:+.2f} deg | control {c.fps:.0f} / '
-                           f'camera {c.capture_fps:.0f} fps | proc {c.processing_ms:.0f} ms | '
-                           f'age {c.frame_age_ms:.0f} ms')
-            if c.driver.last_error:
-                self._set_text(self.mapping_label, None, c.driver.last_error)
+            mode = MODES[int(st[S.MODE])] if 0 <= int(st[S.MODE]) < len(MODES) else 'Hold'
+            self.draw_platform(st, mode)
+            active = st[S.ACTIVE] > 0.5
+            self._set_text(self.toggle_button, 'Pause (level)' if active else 'Enable PID')
+            if st[S.RUNNING] > 0.5:
+                pace = f'pace {100 * st[S.PACE]:.0f}%'
+                if st[S.STOPPING] > 0.5:
+                    plan = f'{mode}: stopping ({pace})'
+                elif st[S.LAPS] > 0:
+                    lap = 'lead-in' if st[S.LAP] < 1 else f'lap {int(st[S.LAP])}/{int(st[S.LAPS])}'
+                    plan = f'{mode}: {lap}, {pace}'
+                else:
+                    plan = f'{mode}: {pace}'
+            else:
+                plan = 'Hold'
+            self._set_text(self.plan_status, plan)
+            valid = st[S.VALID] > 0.5
+            pos = f'X={st[S.X]:+.1f}, Y={st[S.Y]:+.1f} mm' if valid else 'NO BALL'
+            self._set_text(self.status,
+                           f'{pos} | v=({st[S.VX]:+.0f},{st[S.VY]:+.0f}) mm/s | roll={st[S.ROLL]:+.2f} '
+                           f'pitch={st[S.PITCH]:+.2f} deg | plate bias=({st[S.BIAS_X]:+.0f},'
+                           f'{st[S.BIAS_Y]:+.0f}) mm/s²')
+            self._set_text(self.timing,
+                           f'control {st[S.FPS]:.0f} / camera {st[S.CAPTURE_FPS]:.0f} fps | decode '
+                           f'{st[S.DECODE_MS]:.1f} | detect {st[S.DETECT_MS]:.1f} | control '
+                           f'{st[S.CONTROL_MS]:.1f} | peak {st[S.LOOP_MS_PEAK]:.0f} | age '
+                           f'{st[S.AGE_MS]:.0f} ms     {self.camera_info}')
+            if self.show_graphs.get():
+                t = time.monotonic()
+                self._history.append((t, st[S.X] if valid else None, st[S.Y] if valid else None,
+                                      st[S.ROLL], st[S.PITCH], st[S.REF_X], st[S.REF_Y]))
+                while self._history and t - self._history[0][0] > CHART_SECONDS:
+                    self._history.popleft()
+                if t - self._last_chart_draw >= CHART_PERIOD_S:
+                    self.draw_chart()
+                    self._last_chart_draw = t
         except Exception as exc:
-            self.c.active = False
             messagebox.showerror('Control stopped', f'{type(exc).__name__}: {exc}')
             self.root.quit()
             return
         self.root.after(GUI_PERIOD_MS, self.tick)
 
     def run(self):
-        self.c.start()
+        self._render_thread.start()
         self.tick()
-        self.root.mainloop()
-        self.root.destroy()
+        try:
+            self.root.mainloop()
+        finally:
+            self._render_running = False
+            self.root.destroy()

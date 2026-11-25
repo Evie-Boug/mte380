@@ -1,0 +1,1 @@
+time_s,raw_x_mm,raw_y_mm,x_mm,y_mm,vx_mm_s,vy_mm_s,target_x_mm,target_y_mm,physical_roll_deg,physical_pitch_deg,ik_roll_deg,ik_pitch_deg,enabled,servo0_deg,servo1_deg,servo2_deg
